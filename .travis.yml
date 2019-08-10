@@ -1,0 +1,10 @@
+language: julia
+dist: trusty
+julia:
+  - 0.7
+  - 1.0
+notifications:
+  email: false
+script:
+  - if [[ -a .git/shallow ]]; then git fetch --unshallow; fi
+  - julia --check-bounds=yes -e 'include("install.jl"); include("runtests.jl")'

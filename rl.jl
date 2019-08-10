@@ -1,57 +1,91 @@
 using Distributions
+using StatsBase
+using Random
 include("gridworld.jl")
 include("helpers.jl")
 
-randState(mdp::MDP) = states(mdp)[rand(DiscreteUniform(1,numStates(mdp)))]
+mutable struct MappedDiscreteMDP{SType,AType} <: MDP{SType,AType}
+    S::Vector{SType}
+    A::Vector{AType}
+    T::Array{Float64,3}
+    R::Matrix{Float64}
+    discount::Float64
+    stateIndex::Dict
+    actionIndex::Dict
+    nextStates
+end
 
-function valueIteration(mdp::MDP, iterations::Integer)
-  V = zeros(numStates(mdp))
-  Q = zeros(numStates(mdp), numActions(mdp))
-  valueIteration!(V, Q, mdp, iterations)
+function MappedDiscreteMDP(S::Vector, A::Vector, T, R; discount=0.9)
+    stateIndex = Dict([S[i]=>i for i in 1:length(S)])
+    actionIndex = Dict([A[i]=>i for i in 1:length(A)])
+    nextStates = Dict([(S[si], A[ai])=>S[findall(x->x!=0, T[si, ai, :])] for si=1:length(S), ai=1:length(A)])
+    MappedDiscreteMDP(S, A, T, R, discount, stateIndex, actionIndex, nextStates)
+end
+
+MappedDiscreteMDP(S::Vector, A::Vector; discount=0.9) =
+    MappedDiscreteMDP(S, A,
+                    zeros(length(S), length(A), length(S)),
+                    zeros(length(S), length(A)),
+                    discount=discount)
+
+actions(mdp::MappedDiscreteMDP) = mdp.A
+states(mdp::MappedDiscreteMDP) = mdp.S
+n_states(mdp::MappedDiscreteMDP) = length(mdp.S)
+n_actions(mdp::MappedDiscreteMDP) = length(mdp.A)
+reward(mdp::MappedDiscreteMDP, s, a) = mdp.R[mdp.stateIndex[s], mdp.actionIndex[a]]
+transition_pdf(mdp::MappedDiscreteMDP, s0, a, s1) = mdp.T[mdp.stateIndex[s0], mdp.actionIndex[a], mdp.stateIndex[s1]]
+discount(mdp::MappedDiscreteMDP) = mdp.discount
+state_index(mdp::MappedDiscreteMDP, s) = mdp.stateIndex[s]
+action_index(mdp::MappedDiscreteMDP, a) = mdp.actionIndex[s]
+next_states(mdp::MappedDiscreteMDP, s, a) = mdp.nextStates[(s, a)]
+
+
+rand_state(mdp::MDP) = states(mdp)[rand(DiscreteUniform(1,n_states(mdp)))]
+
+function value_iteration(mdp::MDP, iterations::Integer)
+  V = zeros(n_states(mdp))
+  Q = zeros(n_states(mdp), n_actions(mdp))
+  value_iteration!(V, Q, mdp, iterations)
   (V, Q)
 end
 
-function valueIteration!(V::Vector, Q::Matrix, mdp::MDP, iterations::Integer)
+function value_iteration!(V::Vector, Q::Matrix, mdp::MDP, iterations::Integer)
   (S, A, T, R, discount) = locals(mdp)
-  Vold = copy(V)
+  V_old = copy(V)
   for i = 1:iterations
-    for s0i in 1:numStates(mdp)
+    for s0i in 1:n_states(mdp)
       s0 = S[s0i]
-      for ai = 1:numActions(mdp)
+      for ai = 1:n_actions(mdp)
         a = A[ai]
-        Q[s0i,ai] = R(s0, a) + discount * @sum (s1 in nextStates(mdp, s0, a)) (T(s0, a, s1)*Vold[stateIndex(mdp, s1)])
+        Q[s0i,ai] = R(s0, a) + discount * sum([0.0; [T(s0, a, s1)*V_old[state_index(mdp, s1)] for s1 in next_states(mdp, s0, a)]])
       end
       V[s0i] = maximum(Q[s0i,:])
     end
-    copy!(Vold, V)
+    copyto!(V_old, V)
   end
 end
 
-function updateParameters!(mdp::MappedDiscreteMDP, N, Nsa, ρ, s, a)
+function update_parameters!(mdp::MappedDiscreteMDP, N, Nsa, ρ, s, a)
   si = mdp.stateIndex[s]
   ai = mdp.actionIndex[a]
   denom = Nsa[si, ai]
   mdp.T[si, ai, :] = N[si, ai, :] ./ denom
   mdp.R[si, ai] = ρ[si, ai] / denom
-  mdp.nextStates[(s, a)]= mdp.S[find(mdp.T[si, ai, :])]
+  mdp.nextStates[(s, a)]= mdp.S[findall(x->x!=0, mdp.T[si, ai, :])]
 end
 
-function isTerminal(mdp::MDP, s0, a)
-  S1 = nextStates(mdp, s0, a)
-  length(S1) == 0 || 0 == @sum (s1 in S1) transition(mdp, s0, a, s1)
+function isterminal(mdp::MDP, s0, a)
+  S1 = next_states(mdp, s0, a)
+  length(S1) == 0 || 0 == sum(s1 -> transition_pdf(mdp, s0, a, s1), S1)
 end
 
-nextReward(mdp::MDP, s0, a) = reward(mdp, s0, a)
-
-function nextState(mdp::MDP, s0, a)
-  p = @array (s1 in states(mdp)) transition(mdp, s0, a, s1)
-  s1i = rand(Categorical(p))
-  states(mdp)[s1i]
+function generate_s(mdp::MDP, s0, a, rng::AbstractRNG=Random.GLOBAL_RNG)
+    p = [transition_pdf(mdp, s0, a, s1) for s1 in states(mdp)]
+    s1i = sample(rng, Weights(p))
+    states(mdp)[s1i]
 end
 
-abstract Policy
-
-type MLRL <: Policy
+mutable struct MLRL <: Policy
     N::Array{Float64,3} # transition counts
     Nsa::Matrix{Float64} # state-action counts
     ρ::Matrix{Float64} # sum of rewards
@@ -86,8 +120,8 @@ function reset(policy::MLRL)
         policy.Nsa[s0i, ai] += 1
         policy.ρ[s0i, ai] = policy.lastReward
         # update Q and V
-        updateParameters!(policy.mdp, policy.N, policy.Nsa, policy.ρ, policy.lastState, policy.lastAction)
-        valueIteration!(policy.V, policy.Q, policy.mdp, policy.iterations)
+        update_parameters!(policy.mdp, policy.N, policy.Nsa, policy.ρ, policy.lastState, policy.lastAction)
+        value_iteration!(policy.V, policy.Q, policy.mdp, policy.iterations)
         policy.newEpisode = true
     end
 end
@@ -103,8 +137,8 @@ function update(policy::MLRL, s, a, r)
         policy.Nsa[s0i, ai] += 1
         policy.ρ[s0i, ai] += policy.lastReward
         # update Q and V
-        updateParameters!(policy.mdp, policy.N, policy.Nsa, policy.ρ, policy.lastState, policy.lastAction)
-        valueIteration!(policy.V, policy.Q, policy.mdp, policy.iterations)
+        update_parameters!(policy.mdp, policy.N, policy.Nsa, policy.ρ, policy.lastState, policy.lastAction)
+        value_iteration!(policy.V, policy.Q, policy.mdp, policy.iterations)
     end
     policy.lastState = s
     policy.lastAction = a
@@ -114,7 +148,9 @@ end
 
 function action(policy::MLRL, s)
     si = policy.mdp.stateIndex[s]
-    ai = indmax(policy.Q[si, :])
+    Qs = policy.Q[si, :]
+    ais = findall((in)(maximum(Qs)), Qs)
+    ai = rand(ais)
     policy.mdp.A[ai]
 end
 
@@ -131,28 +167,27 @@ function simulate(mdp::MDP, steps::Integer, policy::Policy; script=[])
     V = Any[]
     R = Float64[]
     if length(script) == 0
-        s = randState(mdp)
+        s = rand_state(mdp)
     else
         s = script[1]
     end
     for i = 1:steps
         push!(S, s)
         a = action(policy, s)
-        r = nextReward(mdp, s, a)
+        r = reward(mdp, s, a)
         push!(R, r)
         update(policy, s, a, r)
         push!(V, copy(policy.V))
         if i < length(script)
             s = script[i + 1]
         else
-            if isTerminal(mdp, s, a)
-                s = randState(mdp)
+            if isterminal(mdp, s, a)
+                s = rand_state(mdp)
                 reset(policy)
             else
-                s = nextState(mdp, s, a)
+                s = generate_s(mdp, s, a)
             end
         end
     end
     (S, R, V)
 end
-
